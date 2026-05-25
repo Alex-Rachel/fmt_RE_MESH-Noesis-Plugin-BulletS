@@ -315,7 +315,7 @@ def registerNoesisTypes():
 def toggleAutoLoadMotions(toolIndex):
 	global bAutoLoadMotions
 	bAutoLoadMotions = not bAutoLoadMotions
-	noesis.checkToolMenuItem("Auto Load All Motions", bAutoLoadMotions)
+	noesis.checkToolMenuItem(toolIndex, int(bAutoLoadMotions))
 	return 0
 		
 #Default global variables for internal use:
@@ -1524,7 +1524,7 @@ class openOptionsDialogImportWindow:
 	
 	def clickLoadButton(self):
 		self.isOpen = False
-		if self.isMotlist:
+		if self.isMotlist and self.pak is not None:
 			self.loadedMlists = {}
 			bones = self.pak.bones
 			totalFrames = self.pak.totalFrames
