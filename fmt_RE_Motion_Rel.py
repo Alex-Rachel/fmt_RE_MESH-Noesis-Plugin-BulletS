@@ -101,6 +101,8 @@ g_multiTakeTempExt = ".re_mt_tmp"
 g_multiTakeTempMagic = b"REMTFBX\x00"
 g_multiTakeTempVersion = 1
 g_multiTakeDefaultFrameRate = 60.0
+g_multiTakeMinValidFrameRate = 10.0
+g_multiTakeMaxValidFrameRate = 240.0
 import re
 import time
 from collections import namedtuple
@@ -394,19 +396,96 @@ def cloneNoeKeyFramedBone(kfBone, timeScale=1.0):
 	return newKfBone
 
 def getMultiTakeExportFrameRate(anim):
-	sourceFrameRate = float(noeSafeGet(anim, "sourceFrameRate", 0.0) or 0.0)
-	if sourceFrameRate > 1.0:
+	sourceFrameRate = getValidMultiTakeFrameRate(noeSafeGet(anim, "sourceFrameRate", 0.0))
+	if sourceFrameRate > 0.0:
 		return sourceFrameRate
-	animFrameRate = float(noeSafeGet(anim, "frameRate", 0.0) or 0.0)
-	if animFrameRate > 1.0:
+	animFrameRate = getValidMultiTakeFrameRate(noeSafeGet(anim, "frameRate", 0.0))
+	if animFrameRate > 0.0:
 		return animFrameRate
 	return g_multiTakeDefaultFrameRate
+
+def getValidMultiTakeFrameRate(frameRate, fallbackToDefault=False):
+	frameRate = float(frameRate or 0.0)
+	if frameRate <= 0.0:
+		return g_multiTakeDefaultFrameRate if fallbackToDefault else 0.0
+	if frameRate < g_multiTakeMinValidFrameRate or frameRate > g_multiTakeMaxValidFrameRate:
+		return g_multiTakeDefaultFrameRate if fallbackToDefault else 0.0
+	return frameRate
+
+def shouldScaleMultiTakeKeyTimes(anim):
+	animFrameRate = float(noeSafeGet(anim, "frameRate", 0.0) or 0.0)
+	sourceFrameRate = getMultiTakeExportFrameRate(anim)
+	return animFrameRate <= 1.0 and sourceFrameRate > 1.0
+
+def getNoeKeyFramedBoneMaxTime(kfBone):
+	maxTime = 0.0
+	for keyList in (noeSafeGet(kfBone, "rotationKeys", []), noeSafeGet(kfBone, "translationKeys", []), noeSafeGet(kfBone, "scaleKeys", [])):
+		for key in keyList:
+			keyTime = float(noeSafeGet(key, "time", 0.0) or 0.0)
+			if keyTime > maxTime:
+				maxTime = keyTime
+	return maxTime
+
+def getNoeKeyFramedAnimMaxTime(anim):
+	maxTime = 0.0
+	for kfBone in noeSafeGet(anim, "kfBones", []):
+		boneMaxTime = getNoeKeyFramedBoneMaxTime(kfBone)
+		if boneMaxTime > maxTime:
+			maxTime = boneMaxTime
+	return maxTime
+
+def getMultiTakeExportFrameCount(anim, exportFrameRate=0.0):
+	sourceFrameCount = float(noeSafeGet(anim, "sourceFrameCount", 0.0) or 0.0)
+	if sourceFrameCount > 0.0:
+		return max(1, int(round(sourceFrameCount)))
+	if isinstance(anim, NoeKeyFramedAnim):
+		maxKeyTime = getNoeKeyFramedAnimMaxTime(anim)
+		if shouldScaleMultiTakeKeyTimes(anim):
+			return max(1, int(round(maxKeyTime)) + 1)
+		exportFrameRate = exportFrameRate if exportFrameRate > 1.0 else getMultiTakeExportFrameRate(anim)
+		if exportFrameRate > 0.0:
+			return max(1, int(round(maxKeyTime * exportFrameRate)) + 1)
+		return max(1, int(round(maxKeyTime)) + 1)
+	numFrames = float(noeSafeGet(anim, "numFrames", 0.0) or 0.0)
+	if numFrames > 0.0:
+		return max(1, int(round(numFrames)))
+	return 1
+
+def getMultiTakeExportDuration(anim, exportFrameRate=0.0, exportFrameCount=0):
+	exportFrameRate = exportFrameRate if exportFrameRate > 1.0 else getMultiTakeExportFrameRate(anim)
+	exportFrameCount = exportFrameCount if exportFrameCount > 0 else getMultiTakeExportFrameCount(anim, exportFrameRate)
+	if exportFrameRate > 0.0 and exportFrameCount > 1:
+		return float(exportFrameCount - 1) / exportFrameRate
+	return 0.0
+
+def getMultiTakeSceneFrameRate(anims):
+	rates = []
+	for anim in anims:
+		exportFrameRate = getMultiTakeExportFrameRate(anim)
+		if exportFrameRate > 1.0:
+			rates.append(exportFrameRate)
+	if not rates:
+		return g_multiTakeDefaultFrameRate
+	uniqueRates = sorted(set(round(rate, 6) for rate in rates))
+	if len(uniqueRates) > 1:
+		print("Multi-take FBX export: mixed animation frame rates detected:", uniqueRates, "- using", uniqueRates[-1], "fps for scene timing.")
+	return uniqueRates[-1]
+
+def formatMultiTakeExportFloat(value):
+	formatted = "{0:.6f}".format(float(value)).rstrip("0").rstrip(".")
+	return formatted if formatted else "0"
 
 def cloneNoeAnim(anim, bones):
 	if isinstance(anim, NoeKeyFramedAnim):
 		exportFrameRate = getMultiTakeExportFrameRate(anim)
-		newAnim = NoeKeyFramedAnim(anim.name, bones, [cloneNoeKeyFramedBone(kfBone, 1.0 / exportFrameRate) for kfBone in anim.kfBones], exportFrameRate, noeSafeGet(anim, "flags", 0))
+		timeScale = 1.0 / exportFrameRate if shouldScaleMultiTakeKeyTimes(anim) and exportFrameRate > 0.0 else 1.0
+		exportFrameCount = getMultiTakeExportFrameCount(anim, exportFrameRate)
+		newAnim = NoeKeyFramedAnim(anim.name, bones, [cloneNoeKeyFramedBone(kfBone, timeScale) for kfBone in anim.kfBones], exportFrameRate, noeSafeGet(anim, "flags", 0))
 		newAnim.sourceFrameRate = exportFrameRate
+		newAnim.sourceFrameCount = exportFrameCount
+		newAnim.frameCount = exportFrameCount
+		newAnim.numFrames = exportFrameCount
+		newAnim.duration = getMultiTakeExportDuration(anim, exportFrameRate, exportFrameCount)
 		return newAnim
 	return NoeAnim(anim.name, bones, anim.numFrames, [cloneNoeMat43(mat) for mat in anim.frameMats], anim.frameRate, noeSafeGet(anim, "flags", 0))
 
@@ -493,11 +572,14 @@ def exportMultiTakeFbx(toolIndex):
 	if len(exportModel.meshes) == 0:
 		noesis.messagePrompt("No mesh data available for FBX export. Load the animations on a mesh model first.")
 		return 0
+	exportSceneFrameRate = getMultiTakeSceneFrameRate(exportModel.anims)
+	exportOptions = "-fbxmultitake -fbxcanimtime -fbxnoextraframe -fbxframerate " + formatMultiTakeExportFloat(exportSceneFrameRate)
 
 	print("\nMulti-take FBX export source:",
 		"meshes=" + str(len(exportModel.meshes)),
 		"bones=" + str(len(exportModel.bones)),
-		"anims=" + str(len(g_multiTakeAnims)))
+		"anims=" + str(len(g_multiTakeAnims)),
+		"fps=" + formatMultiTakeExportFloat(exportSceneFrameRate))
 	tempFd = None
 	tempPath = None
 
@@ -510,7 +592,7 @@ def exportMultiTakeFbx(toolIndex):
 					print("Multi-take FBX export: toolLoadGData failed for", label, tempPath)
 					return False
 				gdataLoaded = True
-				if not rapi.toolExportGData(outputPath, "-fbxmultitake"):
+				if not rapi.toolExportGData(outputPath, exportOptions):
 					print("Multi-take FBX export: toolExportGData failed for", label, outputPath)
 					return False
 				return True
@@ -2740,6 +2822,15 @@ def readPackedBitsVec3(packedInt, numBits):
 	z = ((packedInt >> (numBits*2)) & limit) / limit
 	return NoeVec3((x, y, z))
 
+def readMotKeyTimeIndex(bs, keyCompression):
+	if keyCompression == 2:
+		return bs.readUByte()
+	if keyCompression == 4:
+		return bs.readShort()
+	if keyCompression == 5:
+		return bs.readInt()
+	return 0
+
 def convertBits(packedInt, numBits):
 	return packedInt / (2**numBits-1)
 
@@ -2805,7 +2896,7 @@ class motFile:
 		self.boneClipCount = bs.readShort()
 		self.clipCount = bs.readByte()
 		self.uknCount = bs.readByte()
-		self.frameRate = bs.readShort()
+		self.frameRate = bs.readUShort()
 		self.uknCount2 = bs.readShort()
 		self.ukn3 = bs.readShort()
 		self.boneHeaders = []
@@ -3352,11 +3443,15 @@ class motFile:
 					fHeader = boneClip.get(ftype)
 					if fHeader:
 						keyCompression = fHeader.flags >> 20
-						keyReadFunc = bs.readUInt if keyCompression==5 else bs.readUByte if keyCompression==2 else bs.readUShort
 						bs.seek(fHeader.frameIndOffs)
 						keyTimes = []
 						for k in range(fHeader.keyCount):
-							keyTimes.append(keyReadFunc() if fHeader.frameIndOffs else 0)
+							keyTimes.append(readMotKeyTimeIndex(bs, keyCompression) if fHeader.frameIndOffs else 0)
+						if keyTimes:
+							minKeyTime = min(keyTimes)
+							maxKeyTime = max(keyTimes)
+							if minKeyTime < 0 or (self.frameCount > 0 and maxKeyTime > self.frameCount * 4.0):
+								print(self.name, ": Suspicious key times for", self.boneHeaders[boneClipHdr.boneIndex].name, ftype, "compression", keyCompression, "range", (minKeyTime, maxKeyTime), "frameCount", self.frameCount)
 						if fHeader.unpackDataOffs:
 							bs.seek(fHeader.unpackDataOffs)
 							unpackMax = UnpackVec(x=bs.readFloat(), y=bs.readFloat(), z=bs.readFloat(), w=bs.readFloat())
@@ -3494,7 +3589,10 @@ class motlistFile:
 		for i, mot in enumerate(motsToLoad):
 			if not mot.doSkip:
 				mot.anim = NoeKeyFramedAnim(mot.name, self.bones, mot.kfBones, 1)
-				mot.anim.sourceFrameRate = float(mot.frameRate) if mot.frameRate > 1 else g_multiTakeDefaultFrameRate
+				mot.anim.sourceFrameRate = getValidMultiTakeFrameRate(mot.frameRate, True)
+				if mot.frameRate > 0 and abs(float(mot.frameRate) - mot.anim.sourceFrameRate) > 0.001:
+					print(mot.name, ": Ignoring suspicious motion frame rate", mot.frameRate, "and using", mot.anim.sourceFrameRate, "fps for export.")
+				mot.anim.sourceFrameCount = max(1, int(round(mot.frameCount)))
 				self.anims.append(mot.anim)
 				motsByName.append(mot.name)
 		if len(self.anims) > 0:
