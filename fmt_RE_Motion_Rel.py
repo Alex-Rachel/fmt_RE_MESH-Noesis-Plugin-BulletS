@@ -90,6 +90,17 @@ iListboxSize  				= 280					#The height of the list box in the plugin's import m
 import copy
 import math
 import os
+import pickle
+import struct
+import tempfile
+
+#global storage for multi-take FBX export
+g_multiTakeModel = None
+g_multiTakeAnims = []
+g_multiTakeTempExt = ".re_mt_tmp"
+g_multiTakeTempMagic = b"REMTFBX\x00"
+g_multiTakeTempVersion = 1
+g_multiTakeDefaultFrameRate = 60.0
 import re
 import time
 from collections import namedtuple
@@ -305,8 +316,15 @@ def registerNoesisTypes():
 		noesis.setHandlerTypeCheck(handle, meshCheckType)
 		noesis.setHandlerWriteModel(handle, meshWriteModel)
 		addOptions(handle)
+
+	handle = noesis.register("RE Engine Multi-Take Temp [Internal]", g_multiTakeTempExt)
+	noesis.setHandlerTypeCheck(handle, multiTakeTempCheckType)
+	noesis.setHandlerLoadModel(handle, multiTakeTempLoadModel)
 		
 	handle = noesis.registerTool("Auto Load All Motions", toggleAutoLoadMotions, "Toggle auto-loading all motion clips without showing the selection dialog")
+	noesis.setToolSubMenuName(handle, "RE Engine")
+
+	handle = noesis.registerTool("Export Multi-Take FBX", exportMultiTakeFbx, "Export loaded animations as a single FBX with separate takes")
 	noesis.setToolSubMenuName(handle, "RE Engine")
 
 	noesis.logPopup()
@@ -316,6 +334,224 @@ def toggleAutoLoadMotions(toolIndex):
 	global bAutoLoadMotions
 	bAutoLoadMotions = not bAutoLoadMotions
 	noesis.checkToolMenuItem(toolIndex, int(bAutoLoadMotions))
+	return 0
+
+def clearMultiTakeExportData():
+	global g_multiTakeModel, g_multiTakeAnims
+	g_multiTakeModel = None
+	g_multiTakeAnims = []
+
+def cacheMultiTakeExportData(mdl, anims):
+	global g_multiTakeModel, g_multiTakeAnims
+	g_multiTakeModel = mdl
+	g_multiTakeAnims = list(anims)
+
+def cloneNoeVec3(vec):
+	return NoeVec3((vec[0], vec[1], vec[2]))
+
+def cloneNoeVec4(vec):
+	return NoeVec4((vec[0], vec[1], vec[2], vec[3]))
+
+def cloneNoeMat43(mat):
+	return NoeMat43((cloneNoeVec3(mat[0]), cloneNoeVec3(mat[1]), cloneNoeVec3(mat[2]), cloneNoeVec3(mat[3])))
+
+def cloneNoeValue(value):
+	if isinstance(value, NoeQuat):
+		return NoeQuat((value[0], value[1], value[2], value[3]))
+	if isinstance(value, NoeVec4):
+		return cloneNoeVec4(value)
+	if isinstance(value, NoeAngles):
+		return NoeAngles((value[0], value[1], value[2]))
+	if isinstance(value, NoeVec3):
+		return cloneNoeVec3(value)
+	if isinstance(value, NoeMat43):
+		return cloneNoeMat43(value)
+	if isinstance(value, list):
+		return list(value)
+	if isinstance(value, tuple):
+		return tuple(value)
+	return value
+
+def cloneNoeBone(bone):
+	return NoeBone(bone.index, bone.name, cloneNoeMat43(bone.getMatrix()), bone.parentName, bone.parentIndex)
+
+def cloneNoeKeyFramedValue(key, timeScale=1.0):
+	newKey = NoeKeyFramedValue(key.time * timeScale, cloneNoeValue(key.value))
+	newKey.setFlags(noeSafeGet(key, "flags", 0))
+	newKey.setComponentIndex(noeSafeGet(key, "componentIndex", 0))
+	if hasattr(key, "axisIndex"):
+		newKey.setEulerSingleAxisIndex(key.axisIndex)
+	if hasattr(key, "extraData"):
+		newKey.setExtraData(list(key.extraData))
+	return newKey
+
+def cloneNoeKeyFramedBone(kfBone, timeScale=1.0):
+	newKfBone = NoeKeyFramedBone(kfBone.boneIndex)
+	newKfBone.flags = noeSafeGet(kfBone, "flags", 0)
+	newKfBone.setRotation([cloneNoeKeyFramedValue(key, timeScale) for key in kfBone.rotationKeys], kfBone.rotationType, kfBone.rotationInterpolation)
+	newKfBone.setTranslation([cloneNoeKeyFramedValue(key, timeScale) for key in kfBone.translationKeys], kfBone.translationType, kfBone.translationInterpolation)
+	newKfBone.setScale([cloneNoeKeyFramedValue(key, timeScale) for key in kfBone.scaleKeys], kfBone.scaleType, kfBone.scaleInterpolation)
+	return newKfBone
+
+def getMultiTakeExportFrameRate(anim):
+	sourceFrameRate = float(noeSafeGet(anim, "sourceFrameRate", 0.0) or 0.0)
+	if sourceFrameRate > 1.0:
+		return sourceFrameRate
+	animFrameRate = float(noeSafeGet(anim, "frameRate", 0.0) or 0.0)
+	if animFrameRate > 1.0:
+		return animFrameRate
+	return g_multiTakeDefaultFrameRate
+
+def cloneNoeAnim(anim, bones):
+	if isinstance(anim, NoeKeyFramedAnim):
+		exportFrameRate = getMultiTakeExportFrameRate(anim)
+		newAnim = NoeKeyFramedAnim(anim.name, bones, [cloneNoeKeyFramedBone(kfBone, 1.0 / exportFrameRate) for kfBone in anim.kfBones], exportFrameRate, noeSafeGet(anim, "flags", 0))
+		newAnim.sourceFrameRate = exportFrameRate
+		return newAnim
+	return NoeAnim(anim.name, bones, anim.numFrames, [cloneNoeMat43(mat) for mat in anim.frameMats], anim.frameRate, noeSafeGet(anim, "flags", 0))
+
+def cloneNoeMesh(mesh):
+	newMesh = NoeMesh(list(mesh.indices), [cloneNoeVec3(vcmp) for vcmp in mesh.positions], mesh.name, mesh.matName)
+	if len(noeSafeGet(mesh, "normals", [])) == len(mesh.positions):
+		newMesh.setNormals([cloneNoeVec3(vcmp) for vcmp in mesh.normals])
+	if len(noeSafeGet(mesh, "uvs", [])) == len(mesh.positions):
+		newMesh.setUVs([cloneNoeVec3(vcmp) for vcmp in mesh.uvs])
+	if len(noeSafeGet(mesh, "lmUVs", [])) == len(mesh.positions):
+		newMesh.setUVs([cloneNoeVec3(vcmp) for vcmp in mesh.lmUVs], 1)
+	for i, uvList in enumerate(noeSafeGet(mesh, "uvxList", [])):
+		if uvList and len(uvList) == len(mesh.positions):
+			newMesh.setUVs([cloneNoeVec3(vcmp) for vcmp in uvList], 2 + i)
+	if len(noeSafeGet(mesh, "tangents", [])) == len(mesh.positions):
+		newMesh.setTangents([cloneNoeMat43(vcmp) for vcmp in mesh.tangents])
+	if len(noeSafeGet(mesh, "lmTangents", [])) == len(mesh.positions):
+		newMesh.setTangents([cloneNoeMat43(vcmp) for vcmp in mesh.lmTangents], 1)
+	if len(noeSafeGet(mesh, "colors", [])) == len(mesh.positions):
+		newMesh.setColors([cloneNoeVec4(vcmp) for vcmp in mesh.colors])
+	if len(noeSafeGet(mesh, "weights", [])) == len(mesh.positions):
+		newMesh.setWeights([NoeVertWeight(list(vcmp.indices), list(vcmp.weights)) for vcmp in mesh.weights])
+	if len(noeSafeGet(mesh, "boneMap", [])) > 0:
+		newMesh.setBoneMap(list(mesh.boneMap))
+	if hasattr(mesh, "sourceName"):
+		newMesh.setSourceName(mesh.sourceName)
+	if hasattr(mesh, "lmMatName"):
+		newMesh.setLightmap(mesh.lmMatName)
+	return newMesh
+
+def buildMultiTakeExportModel():
+	sourceModel = g_multiTakeModel
+	bones = [cloneNoeBone(bone) for bone in sourceModel.bones]
+	anims = [cloneNoeAnim(anim, bones) for anim in g_multiTakeAnims]
+	meshes = [cloneNoeMesh(mesh) for mesh in sourceModel.meshes if len(mesh.positions) > 0 and len(mesh.indices) > 0]
+	matNames = []
+	for mesh in meshes:
+		if mesh.matName and mesh.matName not in matNames:
+			matNames.append(mesh.matName)
+	modelMats = None
+	if len(matNames) > 0:
+		modelMats = NoeModelMaterials([], [NoeMaterial(matName, "") for matName in matNames])
+	return NoeModel(meshes, bones, anims, modelMats)
+
+def serializeMultiTakeExportModel(exportModel):
+	return g_multiTakeTempMagic + struct.pack("<I", g_multiTakeTempVersion) + pickle.dumps(exportModel, pickle.HIGHEST_PROTOCOL)
+
+def multiTakeTempCheckType(data):
+	headerSize = len(g_multiTakeTempMagic) + 4
+	if len(data) < headerSize:
+		return 0
+	return 1 if data[:len(g_multiTakeTempMagic)] == g_multiTakeTempMagic else 0
+
+def multiTakeTempLoadModel(data, mdlList):
+	if not multiTakeTempCheckType(data):
+		return 0
+	try:
+		version = struct.unpack("<I", data[len(g_multiTakeTempMagic):len(g_multiTakeTempMagic) + 4])[0]
+		if version != g_multiTakeTempVersion:
+			print("Unsupported multi-take temp version:", version)
+			return 0
+		exportModel = pickle.loads(data[len(g_multiTakeTempMagic) + 4:])
+	except Exception as e:
+		print("Failed to deserialize multi-take temp model:", e)
+		return 0
+	if not isinstance(exportModel, NoeModel):
+		print("Invalid multi-take temp model payload:", type(exportModel))
+		return 0
+	mdlList.append(exportModel)
+	return 1
+
+def exportMultiTakeFbx(toolIndex):
+	global g_multiTakeModel, g_multiTakeAnims
+	if g_multiTakeModel is None or not g_multiTakeAnims:
+		noesis.messagePrompt("No animations loaded. Load a model with animations first.")
+		return 0
+	outputPath = noesis.userPrompt(noesis.NOEUSERVAL_FILEPATH, "Export Multi-Take FBX", "Choose output FBX path", "multi_take_anim.fbx", None)
+	if not outputPath:
+		return 0
+	if os.path.splitext(outputPath)[1].lower() != ".fbx":
+		outputPath += ".fbx"
+
+	exportModel = buildMultiTakeExportModel()
+	if len(exportModel.meshes) == 0:
+		noesis.messagePrompt("No mesh data available for FBX export. Load the animations on a mesh model first.")
+		return 0
+
+	print("\nMulti-take FBX export source:",
+		"meshes=" + str(len(exportModel.meshes)),
+		"bones=" + str(len(exportModel.bones)),
+		"anims=" + str(len(g_multiTakeAnims)))
+	tempFd = None
+	tempPath = None
+
+	def runToolExport(setupRapi, label):
+		gdataLoaded = False
+		try:
+			with NoePreserveRapiContext():
+				setupRapi()
+				if not rapi.toolLoadGData(tempPath):
+					print("Multi-take FBX export: toolLoadGData failed for", label, tempPath)
+					return False
+				gdataLoaded = True
+				if not rapi.toolExportGData(outputPath, "-fbxmultitake"):
+					print("Multi-take FBX export: toolExportGData failed for", label, outputPath)
+					return False
+				return True
+		finally:
+			if gdataLoaded:
+				try:
+					rapi.toolFreeGData()
+				except Exception as freeErr:
+					print("Multi-take FBX export: toolFreeGData failed for", label, freeErr)
+	try:
+		tempFd, tempPath = tempfile.mkstemp(suffix=g_multiTakeTempExt, prefix="re_multitake_")
+		with os.fdopen(tempFd, "wb") as f:
+			f.write(serializeMultiTakeExportModel(exportModel))
+		tempFd = None
+
+		if noesis.isPreviewModuleRAPIValid() > 0 and runToolExport(noesis.setPreviewModuleRAPI, "preview rapi"):
+			print("\nExported " + str(len(g_multiTakeAnims)) + " animations as multi-take FBX to: " + outputPath)
+			return 0
+
+		noeMod = noesis.instantiateModule()
+		try:
+			if runToolExport(lambda: noesis.setModuleRAPI(noeMod), "temporary module"):
+				print("\nExported " + str(len(g_multiTakeAnims)) + " animations as multi-take FBX to: " + outputPath)
+				return 0
+		finally:
+			noesis.freeModule(noeMod)
+
+		noesis.messagePrompt("Failed to prepare model data for FBX export. Check the Noesis log for the attempt details.")
+		return 0
+	except Exception as e:
+		print("Multi-take FBX export exception:", e)
+		noesis.messagePrompt("FBX export failed: " + str(e))
+		return 0
+	finally:
+		if tempFd is not None:
+			os.close(tempFd)
+		if tempPath and os.path.exists(tempPath):
+			try:
+				os.remove(tempPath)
+			except OSError as removeErr:
+				print("Multi-take FBX export: failed to remove temp file:", removeErr)
 	return 0
 		
 #Default global variables for internal use:
@@ -3258,13 +3494,13 @@ class motlistFile:
 		for i, mot in enumerate(motsToLoad):
 			if not mot.doSkip:
 				mot.anim = NoeKeyFramedAnim(mot.name, self.bones, mot.kfBones, 1)
+				mot.anim.sourceFrameRate = float(mot.frameRate) if mot.frameRate > 1 else g_multiTakeDefaultFrameRate
 				self.anims.append(mot.anim)
 				motsByName.append(mot.name)
 		if len(self.anims) > 0:
 			print("\nImported", len(self.anims), "animations from motlist '", self.name, "':")
 			for anim in self.anims:
-				print(" @ " + str(int(self.totalFrames)), "	'", anim.name, "'")
-				self.totalFrames += self.mots[motsByName.index(anim.name)].frameCount
+				print("	'", anim.name, "'")
 
 def motlistCheckType(data):
 	bs = NoeBitStream(data)
@@ -3297,7 +3533,8 @@ def motlistLoadModel(data, mdlList):
 		mlDialog.createMotlistWindow()
 	
 	mdl = NoeModel()
-	
+	anims = []
+
 	if not mlDialog.isCancelled:
 		mdl.setBones(mlDialog.pak.bones)
 		collapseBones(mdl, 100)
@@ -3313,7 +3550,6 @@ def motlistLoadModel(data, mdlList):
 				if bone.name.lower() not in mdlBoneNames:
 					bone.index = len(bones)
 					bones.append(bone)
-		anims = []
 		for mlist in sortedMlists:
 			mlist.bones = bones
 			mlist.readBoneHeaders(mlDialog.loadItems)
@@ -3321,11 +3557,14 @@ def motlistLoadModel(data, mdlList):
 		for mlist in sortedMlists:
 			mlist.makeAnims(mlDialog.loadItems)
 			anims.extend(mlist.anims)
-			
+
 		mdl.setBones(bones)
 		mdl.setAnims(anims)
 		rapi.setPreviewOption("setAnimSpeed", "60.0")
-	
+		cacheMultiTakeExportData(mdl, anims)
+	else:
+		clearMultiTakeExportData()
+
 	mdlList.append(mdl)
 	
 	return 1
@@ -4704,6 +4943,7 @@ def meshLoadModel(data, mdlList):
 	else:
 		mdl = NoeModel()
 	
+	anims = []
 	doLoadAnims = (dialogOptions.motDialog and dialogOptions.motDialog.loadItems and not dialogOptions.motDialog.isCancelled)
 	if doLoadAnims:
 		mlDialog = dialogOptions.motDialog
@@ -4723,22 +4963,20 @@ def meshLoadModel(data, mdlList):
 				if bone.name.lower() not in mdlBoneNames:
 					bone.index = len(bones)
 					bones.append(bone)
-		anims = []
-		startFrame = 0
 		for mlist in sortedMlists:
 			mlist.bones = bones
 			mlist.readBoneHeaders(mlDialog.loadItems)
-			mlist.totalFrames = startFrame
 			mlist.read(mlDialog.loadItems)
-			startFrame = mlist.totalFrames
 		for mlist in sortedMlists:
 			mlist.makeAnims(mlDialog.loadItems)
 			anims.extend(mlist.anims)
 		mdl.setBones(bones)
 		mdl.setAnims(anims)
 		rapi.setPreviewOption("setAnimSpeed", "60.0")
+		cacheMultiTakeExportData(mdl, anims)
 	else:
 		mdl.setBones(dialog.pak.fullBoneList)
+		clearMultiTakeExportData()
 		
 	mdl.setModelMaterials(NoeModelMaterials(dialog.pak.fullTexList, dialog.pak.fullMatList))
 	
